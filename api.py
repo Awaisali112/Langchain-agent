@@ -36,7 +36,7 @@ from langchain_ollama import ChatOllama
 
 load_dotenv()
 
-MODEL_NAME = os.getenv("MODEL_NAME", "minimax-m2.5:cloud")
+MODEL_NAME = os.getenv("MODEL_NAME", "minimax-m2.7:cloud")
 MODEL_TEMP = float(os.getenv("MODEL_TEMP", "0.7"))
 CHECKPOINT_DB = os.getenv("CHECKPOINT_DB", "research_research.db")
 
@@ -85,9 +85,9 @@ tool_retry = ToolRetryMiddleware(
 model_retry = ModelRetryMiddleware(
     max_retries=2, on_failure="continue", max_delay=60, backoff_factor=2.0,
 )
-model_fallback = ModelFallbackMiddleware("ollama:minimax-m2.5:cloud")
+model_fallback = ModelFallbackMiddleware("ollama:minimax-m2.7:cloud")
 summ_middleware = SummarizationMiddleware(
-    model="ollama:minimax-m2.5:cloud",
+    model="ollama:minimax-m2.7:cloud",
     trigger=("tokens", 4000),
     keep=("messages", 20),
 )
@@ -190,29 +190,41 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
     config = {"configurable": {"thread_id": req.thread_id}}
 
     async def event_stream():
+        queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_event_loop()
 
         def run_agent():
-            chunks = []
-            for chunk in agent.stream(
-                {"messages": [HumanMessage(content=req.message)]},
-                config=config,
-                stream_mode="values",
-            ):
-                latest = chunk["messages"][-1]
-                if isinstance(latest, AIMessage) and latest.content:
-                    chunks.append({"type": "text", "content": latest.content})
-                elif hasattr(latest, "tool_calls") and latest.tool_calls:
-                    tool_names = [tc["name"] for tc in latest.tool_calls]
-                    chunks.append({"type": "tool_call", "tools": tool_names})
-            return chunks
+            try:
+                for chunk in agent.stream(
+                    {"messages": [HumanMessage(content=req.message)]},
+                    config=config,
+                    stream_mode="values",
+                ):
+                    latest = chunk["messages"][-1]
+                    if isinstance(latest, AIMessage) and latest.content:
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait, {"type": "text", "content": latest.content}
+                        )
+                    elif hasattr(latest, "tool_calls") and latest.tool_calls:
+                        tool_names = [tc["name"] for tc in latest.tool_calls]
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait, {"type": "tool_call", "tools": tool_names}
+                        )
+            except Exception as e:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait, {"type": "error", "content": str(e)}
+                )
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+        loop.run_in_executor(None, run_agent)
 
         try:
-            chunks = await loop.run_in_executor(None, run_agent)
-            for chunk in chunks:
-                yield f"data: {json.dumps(chunk)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield f"data: {json.dumps(item)}\n\n"
         finally:
             yield "data: [DONE]\n\n"
 
